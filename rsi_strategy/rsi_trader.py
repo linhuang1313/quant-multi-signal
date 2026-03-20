@@ -6,10 +6,12 @@ RSI均值回归自动交易系统
 策略规则:
   SPY: 价格>MA200 + RSI(2)<10 + IBS<0.3 → 买入, 价格>MA5 → 卖出
   QQQ: 价格>MA200 + RSI(2)<15 → 买入, 价格>MA5 → 卖出
+  GLD: 价格>MA200 + RSI(2)<10 → 买入, 价格>MA5 → 卖出
 
 回测表现:
   SPY: Sharpe 3.92 | 胜率 79.3% | 回撤 -14.0% | 33年217笔交易
   QQQ: Sharpe 2.21 | 胜率 69.3% | 回撤 -9.6% | 27年287笔交易
+  GLD: Sharpe 1.08 | 胜率 73.4% | 回撤 -11.4% | 21年139笔交易
 
 Alpaca Paper Trading API
 """
@@ -69,6 +71,18 @@ STRATEGIES = {
         'position_pct': 0.40,   # 占账户40%仓位
         'max_hold_days': 10,
         'stop_loss_pct': 0.05,
+    },
+    'GLD': {
+        'name': 'GLD 黄金RSI均值回归',
+        'rsi_period': 2,
+        'rsi_entry': 10,       # RSI(2) < 10 买入
+        'ma_period': 200,       # 价格须在MA200之上
+        'ma_exit': 5,           # 价格 > MA5 卖出
+        'use_ibs': False,       # GLD不用IBS
+        'ibs_threshold': 1.0,
+        'position_pct': 0.20,   # 占账户20%仓位（黄金波动大，仓位小）
+        'max_hold_days': 10,    # 最大持仓10天
+        'stop_loss_pct': 0.05,  # 硬止损5%
     },
 }
 
