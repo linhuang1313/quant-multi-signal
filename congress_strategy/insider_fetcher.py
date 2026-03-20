@@ -80,6 +80,70 @@ class InsiderFetcher:
         print(f"📊 内部人数据: 共 {len(df)} 笔有效交易")
         return df
 
+    def fetch_sales(self, use_cache: bool = True) -> pd.DataFrame:
+        """获取内部人卖出数据 (做空信号源)"""
+        cache_file = DATA_DIR / "insider_sales.csv"
+
+        if use_cache and cache_file.exists():
+            mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
+            if datetime.now() - mod_time < timedelta(hours=self.cache_hours):
+                df = pd.read_csv(cache_file, parse_dates=['filing_date', 'trade_date'])
+                print(f"📦 内部人卖出缓存: {len(df)} 笔")
+                return df
+
+        print("🔄 获取内部人卖出数据...")
+        try:
+            resp = requests.get(
+                "http://openinsider.com/insider-sales",
+                headers=HEADERS, timeout=15
+            )
+            resp.raise_for_status()
+            df = self._parse_openinsider_sales_table(resp.text)
+            if df is not None and len(df) > 0:
+                df.to_csv(cache_file, index=False)
+                print(f"  ✅ 内部人卖出: {len(df)} 笔")
+                return df
+        except Exception as e:
+            print(f"  ⚠️ 内部人卖出获取失败: {e}")
+        return pd.DataFrame()
+
+    def _parse_openinsider_sales_table(self, html: str) -> Optional[pd.DataFrame]:
+        """解析 OpenInsider 卖出表格"""
+        try:
+            dfs = pd.read_html(StringIO(html))
+            main_df = None
+            for tdf in dfs:
+                if tdf.shape[0] >= 5 and tdf.shape[1] >= 12:
+                    main_df = tdf
+                    break
+            if main_df is None:
+                return None
+
+            main_df.columns = [c.replace('\xa0', '_') for c in main_df.columns]
+
+            result = pd.DataFrame()
+            result['ticker'] = main_df['Ticker'].str.strip()
+            result['company_name'] = main_df.get('Company_Name', '')
+            result['filing_date'] = pd.to_datetime(main_df['Filing_Date'].str.strip(), errors='coerce')
+            result['trade_date'] = pd.to_datetime(main_df['Trade_Date'].str.strip(), errors='coerce')
+            result['insider_name'] = main_df.get('Insider_Name', '')
+            result['title'] = main_df.get('Title', '')
+            result['trade_type'] = main_df['Trade_Type']
+            result['price'] = main_df['Price'].apply(self._parse_dollar)
+            result['qty'] = main_df['Qty'].apply(self._parse_number)
+            result['value'] = main_df['Value'].apply(self._parse_dollar)
+            result['ownership_change'] = main_df.get('ΔOwn', '0%').apply(self._parse_pct)
+
+            # 只保留卖出 (S - Sale)
+            result = result[result['trade_type'].str.contains('S - Sale', na=False)].copy()
+            result = result[result['ticker'].str.match(r'^[A-Z]{1,5}$', na=False)].copy()
+            result['signal_type'] = 'insider_sale'
+
+            return result
+        except Exception as e:
+            logger.error(f"HTML 解析失败: {e}")
+            return None
+
     def _fetch_cluster_buys(self) -> Optional[pd.DataFrame]:
         """获取集群买入数据"""
         try:
