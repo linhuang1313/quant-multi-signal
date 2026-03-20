@@ -498,12 +498,16 @@ class MultiSignalEngine:
 if __name__ == "__main__":
     from data_fetcher import fetch_congress_trades
     from insider_fetcher import fetch_insider_trades
-    from options_fetcher import scan_options_flow
+    from options_fetcher import scan_options_flow, get_extra_tickers_from_signals
 
     congress = fetch_congress_trades(days=60)
-    insider = fetch_insider_trades()
-    options = scan_options_flow()
+    insider = fetch_insider_trades(use_cache=False)
 
-    engine = MultiSignalEngine(min_score=30)
+    # 动态补扫：从国会+内部人数据中提取额外 ticker 一并扫描期权
+    extra = get_extra_tickers_from_signals(congress, insider)
+    print(f"\n📡 动态补扫额外标的: {len(extra)} 只")
+    options = scan_options_flow(use_cache=False, extra_tickers=extra)
+
+    engine = MultiSignalEngine(congress_lookback_days=45, min_score=30)
     signals = engine.generate_signals(congress, insider, options, top_n=20)
     print(MultiSignalEngine.format_signals(signals))
