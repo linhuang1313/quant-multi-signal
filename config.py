@@ -13,8 +13,8 @@ Alpaca API 配置文件
 # ============================================================
 # 🔑 在这里填入你的 Alpaca Paper Trading API Keys
 # ============================================================
-API_KEY = "PKMMCV2PAM45UCO7QNHNTL52SD"
-API_SECRET = "JxEct6xy512y8189skLkp7GekUKYnYUgjsPybtuPeBQ"
+API_KEY = "PKCTMFDROQEWG5ESKZB75ZEPZA"
+API_SECRET = "DynBRwaD34metqn1FsnTiPvCBxdBMKkRwoothbxwxWw8"
 
 # Paper Trading（模拟盘）的 Base URL
 # 实盘交易时改为: https://api.alpaca.markets
