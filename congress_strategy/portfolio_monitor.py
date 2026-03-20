@@ -1,14 +1,19 @@
 """
-持仓监控 + 自动止盈止损模块 - Portfolio Monitor
-================================================
-盘中每小时检查持仓，执行止盈止损策略
+持仓监控 + 自动止盈止损模块 - Portfolio Monitor v2.0
+===========================================================
+盘中每小时检查持仓（做多+做空），执行止盈止损策略
 
-策略规则:
-1. 固定止盈: +15% → 市价卖出
-2. 固定止损: -8% → 市价卖出
-3. 移动止损: 从持仓最高点回落 6% → 市价卖出
-4. 最大持仓: 30天 → 到期平仓
-5. 信号过期: 共振信号过期后降级关注
+做多策略 (300组回测最优):
+1. 止盈: +8% → 市价卖出
+2. 止损: -5% → 市价卖出
+3. 移动止损: 从高点回落 4% (盈利超3%启用)
+4. 最大持仓: 10天 → 到期平仓
+
+做空策略 (360组回测最优):
+1. 止盈: +8% → 买入平仓
+2. 止损: -5% → 买入平仓
+3. 移动止损: 从低点反弹 5% (盈利超3%启用)
+4. 最大持仓: 15天 → 到期平仓
 
 Alpaca Paper Trading API
 """
@@ -26,13 +31,21 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 
 # ============================================================
-# 策略参数
+# 做多策略参数 (300组回测最优)
 # ============================================================
-TAKE_PROFIT_PCT = 0.08       # 止盈 +8% (回测最优)
-STOP_LOSS_PCT = -0.05        # 止损 -5% (回测最优)
-TRAILING_STOP_PCT = 0.04     # 移动止损: 从高点回落 4% (回测最优)
-MAX_HOLD_DAYS = 10           # 最大持仓 10 天 (回测最优)
+TAKE_PROFIT_PCT = 0.08       # 止盈 +8%
+STOP_LOSS_PCT = -0.05        # 止损 -5%
+TRAILING_STOP_PCT = 0.04     # 移动止损: 从高点回落 4%
+MAX_HOLD_DAYS = 10           # 最大持仓 10 天
 POSITION_SIZE = 2000         # 每只股票默认仓位 $2,000
+
+# ============================================================
+# 做空策略参数 (360组回测最优)
+# ============================================================
+SHORT_TAKE_PROFIT_PCT = 0.08   # 做空止盈 +8% (股价下跌8%平仓)
+SHORT_STOP_LOSS_PCT = -0.05    # 做空止损 -5% (股价上涨5%止损)
+SHORT_TRAILING_STOP_PCT = 0.05 # 做空移动止损: 从低点反弹 5%
+SHORT_MAX_HOLD_DAYS = 15       # 做空最大持仓 15 天
 
 # ============================================================
 # Alpaca API
@@ -116,9 +129,41 @@ class PortfolioMonitor:
         logger.error(f"❌ 买入失败 {symbol}: {resp.text}")
         return False
 
+    def place_short_sell_order(self, symbol: str, qty: int) -> bool:
+        """提交做空卖出订单"""
+        payload = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day"
+        }
+        resp = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=payload)
+        if resp.status_code in (200, 201):
+            logger.info(f"✅ 做空卖出 {symbol} {qty}股")
+            return True
+        logger.error(f"❌ 做空失败 {symbol}: {resp.text}")
+        return False
+
+    def place_cover_order(self, symbol: str, qty: str, reason: str) -> bool:
+        """提交做空平仓订单 (买入平仓)"""
+        payload = {
+            "symbol": symbol,
+            "qty": qty,
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "day"
+        }
+        resp = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=payload)
+        if resp.status_code in (200, 201):
+            logger.info(f"✅ 做空平仓 {symbol} {qty}股 原因: {reason}")
+            return True
+        logger.error(f"❌ 做空平仓失败 {symbol}: {resp.text}")
+        return False
+
     def check_and_execute(self) -> Dict:
         """
-        核心逻辑: 检查所有持仓，执行止盈止损
+        核心逻辑: 检查所有持仓（做多+做空），执行止盈止损
         
         Returns:
             Dict: 执行结果摘要
@@ -144,13 +189,15 @@ class PortfolioMonitor:
         for pos in positions:
             symbol = pos['symbol']
             qty = pos['qty']
+            side = pos.get('side', 'long')  # 'long' or 'short'
+            is_short = (side == 'short')
             avg_price = float(pos['avg_entry_price'])
             current_price = float(pos['current_price'])
             market_value = float(pos['market_value'])
             unrealized_pl = float(pos['unrealized_pl'])
             unrealized_plpc = float(pos['unrealized_plpc'])
 
-            summary['total_market_value'] += market_value
+            summary['total_market_value'] += abs(market_value)
             summary['total_pnl'] += unrealized_pl
 
             # 初始化追踪数据
@@ -159,65 +206,107 @@ class PortfolioMonitor:
                     'entry_date': now.isoformat(),
                     'entry_price': avg_price,
                     'high_price': current_price,
+                    'low_price': current_price,
                     'high_date': now.isoformat(),
+                    'low_date': now.isoformat(),
+                    'side': side,
                 }
 
             track = self.tracking[symbol]
 
-            # 更新最高价
+            # 更新最高价/最低价
             if current_price > track.get('high_price', 0):
                 track['high_price'] = current_price
                 track['high_date'] = now.isoformat()
+            if current_price < track.get('low_price', float('inf')):
+                track['low_price'] = current_price
+                track['low_date'] = now.isoformat()
 
             high_price = track['high_price']
+            low_price = track.get('low_price', current_price)
             drawdown_from_high = (current_price - high_price) / high_price if high_price > 0 else 0
+            bounce_from_low = (current_price - low_price) / low_price if low_price > 0 else 0
 
             # 持仓天数
             entry_date = datetime.fromisoformat(track['entry_date'])
             hold_days = (now - entry_date).days
 
             # 状态显示
+            side_label = "🔻做空" if is_short else "🔺做多"
             pnl_emoji = "🟢" if unrealized_plpc >= 0 else "🔴"
-            print(f"\n  {pnl_emoji} {symbol:6s}  {qty:>6s}股  均价${avg_price:.2f}  "
-                  f"现价${current_price:.2f}  盈亏{unrealized_plpc*100:+.2f}%  "
-                  f"高点回撤{drawdown_from_high*100:.1f}%  持仓{hold_days}天")
+            print(f"\n  {pnl_emoji} {side_label} {symbol:6s}  {abs(int(float(qty))):>6}股  "
+                  f"均价${avg_price:.2f}  现价${current_price:.2f}  "
+                  f"盈亏{unrealized_plpc*100:+.2f}%  持仓{hold_days}天")
 
             # ============================================================
-            # 止盈止损判断
+            # 止盈止损判断 —— 做多 vs 做空使用不同参数
             # ============================================================
             action = None
             reason = None
 
-            # 1. 止盈检查
-            if unrealized_plpc >= TAKE_PROFIT_PCT:
-                action = "SELL"
-                reason = f"🎯 止盈触发 ({unrealized_plpc*100:+.1f}% >= {TAKE_PROFIT_PCT*100}%)"
+            if is_short:
+                # === 做空持仓策略 ===
+                # Alpaca的unrealized_plpc已经正确反映做空盈亏（股价跌=盈利）
+                tp = SHORT_TAKE_PROFIT_PCT
+                sl = SHORT_STOP_LOSS_PCT
+                ts = SHORT_TRAILING_STOP_PCT
+                max_hold = SHORT_MAX_HOLD_DAYS
 
-            # 2. 止损检查
-            elif unrealized_plpc <= STOP_LOSS_PCT:
-                action = "SELL"
-                reason = f"🛑 止损触发 ({unrealized_plpc*100:+.1f}% <= {STOP_LOSS_PCT*100}%)"
+                # 1. 做空止盈: 股价下跌足够
+                if unrealized_plpc >= tp:
+                    action = "COVER"
+                    reason = f"🎯 做空止盈 ({unrealized_plpc*100:+.1f}% >= {tp*100}%)"
 
-            # 3. 移动止损检查 (需要先有盈利才启用)
-            elif unrealized_plpc > 0.03 and drawdown_from_high <= -TRAILING_STOP_PCT:
-                action = "SELL"
-                reason = f"📉 移动止损 (从高点${high_price:.2f}回落{drawdown_from_high*100:.1f}%)"
+                # 2. 做空止损: 股价上涨超限
+                elif unrealized_plpc <= sl:
+                    action = "COVER"
+                    reason = f"🛑 做空止损 ({unrealized_plpc*100:+.1f}% <= {sl*100}%)"
 
-            # 4. 最大持仓天数
-            elif hold_days >= MAX_HOLD_DAYS:
-                action = "SELL"
-                reason = f"⏰ 持仓到期 ({hold_days}天 >= {MAX_HOLD_DAYS}天)"
+                # 3. 做空移动止损: 从低点反弹超过阈值
+                elif unrealized_plpc > 0.03 and bounce_from_low >= ts:
+                    action = "COVER"
+                    reason = f"📈 做空移动止损 (从低点${low_price:.2f}反弹{bounce_from_low*100:.1f}%)"
+
+                # 4. 最大持仓天数
+                elif hold_days >= max_hold:
+                    action = "COVER"
+                    reason = f"⏰ 做空到期 ({hold_days}天 >= {max_hold}天)"
+
+            else:
+                # === 做多持仓策略 ===
+                # 1. 止盈检查
+                if unrealized_plpc >= TAKE_PROFIT_PCT:
+                    action = "SELL"
+                    reason = f"🎯 止盈触发 ({unrealized_plpc*100:+.1f}% >= {TAKE_PROFIT_PCT*100}%)"
+
+                # 2. 止损检查
+                elif unrealized_plpc <= STOP_LOSS_PCT:
+                    action = "SELL"
+                    reason = f"🛑 止损触发 ({unrealized_plpc*100:+.1f}% <= {STOP_LOSS_PCT*100}%)"
+
+                # 3. 移动止损检查 (需要先有盈利才启用)
+                elif unrealized_plpc > 0.03 and drawdown_from_high <= -TRAILING_STOP_PCT:
+                    action = "SELL"
+                    reason = f"📉 移动止损 (从高点${high_price:.2f}回落{drawdown_from_high*100:.1f}%)"
+
+                # 4. 最大持仓天数
+                elif hold_days >= MAX_HOLD_DAYS:
+                    action = "SELL"
+                    reason = f"⏰ 持仓到期 ({hold_days}天 >= {MAX_HOLD_DAYS}天)"
 
             # 执行操作
-            if action == "SELL":
+            if action in ("SELL", "COVER"):
                 print(f"    → {reason}")
-                # 取整数股数卖出
-                sell_qty = str(int(float(qty)))
-                success = self.place_sell_order(symbol, sell_qty, reason)
+                close_qty = str(int(abs(float(qty))))
+                if action == "COVER":
+                    success = self.place_cover_order(symbol, close_qty, reason)
+                else:
+                    success = self.place_sell_order(symbol, close_qty, reason)
                 actions.append({
                     "symbol": symbol,
-                    "action": "SELL",
-                    "qty": sell_qty,
+                    "action": action,
+                    "side": side,
+                    "qty": close_qty,
                     "reason": reason,
                     "pnl_pct": round(unrealized_plpc * 100, 2),
                     "pnl_usd": round(unrealized_pl, 2),
