@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+congress_strategy/data/
+*.csv
+*.json
+!congress_strategy/spec.md
+.env
