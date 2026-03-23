@@ -59,6 +59,7 @@ STRATEGIES = {
         'position_pct': 0.40,   # 占账户40%仓位
         'max_hold_days': 10,    # 最大持仓10天（安全阀）
         'stop_loss_pct': 0.05,  # 硬止损5%
+        'take_profit_pct': 0.03, # 止盈 3%（均值回归目标适中）
     },
     'QQQ': {
         'name': 'QQQ RSI均值回归',
@@ -71,6 +72,7 @@ STRATEGIES = {
         'position_pct': 0.40,   # 占账户40%仓位
         'max_hold_days': 10,
         'stop_loss_pct': 0.05,
+        'take_profit_pct': 0.04, # 止盈 4%（QQQ波动更大）
     },
     'GLD': {
         'name': 'GLD 黄金RSI均值回归',
@@ -83,6 +85,7 @@ STRATEGIES = {
         'position_pct': 0.20,   # 占账户20%仓位（黄金波动大，仓位小）
         'max_hold_days': 10,    # 最大持仓10天
         'stop_loss_pct': 0.05,  # 硬止损5%
+        'take_profit_pct': 0.03, # 止盈 3%
     },
 }
 
@@ -177,22 +180,70 @@ class RSITrader:
             return resp.json()
         return None
     
-    def place_buy(self, symbol: str, qty: int, reason: str) -> bool:
-        payload = {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day"
-        }
+    def place_buy(self, symbol: str, qty: int, reason: str, entry_price: float = None) -> bool:
+        """
+        下单买入，同时挂 bracket order（止损+止盈）
+        - 止损: 入场价 * (1 - stop_loss_pct)，即 -5%
+        - 止盈: 入场价 * (1 + take_profit_pct)，基于MA5目标
+        
+        Bracket order 由券商实时监控，毫秒级响应，不依赖我们的 cron 扫描
+        """
+        params = STRATEGIES.get(symbol, {})
+        stop_loss_pct = params.get('stop_loss_pct', 0.05)
+        take_profit_pct = params.get('take_profit_pct', 0.03)
+        
+        # 计算止损止盈价格
+        if entry_price and entry_price > 0:
+            stop_price = round(entry_price * (1 - stop_loss_pct), 2)
+            take_profit_price = round(entry_price * (1 + take_profit_pct), 2)
+            
+            payload = {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "gtc",
+                "order_class": "bracket",
+                "take_profit": {
+                    "limit_price": str(take_profit_price)
+                },
+                "stop_loss": {
+                    "stop_price": str(stop_price)
+                }
+            }
+            bracket_info = f" [止损${stop_price} / 止盈${take_profit_price}]"
+        else:
+            # fallback: 无法计算价格时用普通市价单
+            payload = {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day"
+            }
+            bracket_info = " [无bracket]"
+        
         resp = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=payload)
         if resp.status_code in (200, 201):
-            print(f"  ✅ 买入 {symbol} {qty}股 — {reason}")
+            print(f"  ✅ 买入 {symbol} {qty}股 — {reason}{bracket_info}")
             return True
         print(f"  ❌ 买入失败 {symbol}: {resp.text}")
         return False
     
+    def cancel_open_orders(self, symbol: str):
+        """取消某个标的的所有挂单（卖出前先取消bracket的止损止盈单）"""
+        resp = requests.get(f"{BASE_URL}/orders?status=open&symbols={symbol}", headers=HEADERS)
+        if resp.status_code == 200:
+            orders = resp.json()
+            for order in orders:
+                oid = order['id']
+                requests.delete(f"{BASE_URL}/orders/{oid}", headers=HEADERS)
+                print(f"    🗑️ 取消挂单 {order.get('type','')} {order.get('side','')} {symbol} (ID: {oid[:8]}...)")
+    
     def place_sell(self, symbol: str, qty: str, reason: str) -> bool:
+        # 先取消该标的所有挂单（包括bracket的止损止盈腿）
+        self.cancel_open_orders(symbol)
+        
         payload = {
             "symbol": symbol,
             "qty": qty,
@@ -306,7 +357,7 @@ class RSITrader:
                 qty = max(1, int(cash * 0.95 / price))
                 actual_value = qty * price
             
-            success = self.place_buy(ticker, qty, sig['reason'])
+            success = self.place_buy(ticker, qty, sig['reason'], entry_price=price)
             if success:
                 self.tracking[ticker] = {
                     'entry_date': datetime.now().isoformat(),

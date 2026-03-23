@@ -121,22 +121,62 @@ class TuesdayTrader:
             return resp.json()
         return None
     
-    def place_buy(self, symbol: str, qty: int, reason: str) -> bool:
-        payload = {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day"
-        }
+    def place_buy(self, symbol: str, qty: int, reason: str, entry_price: float = None) -> bool:
+        """
+        下单买入，同时挂 bracket order（止损+止盈）
+        Tuesday策略: 止损-3%（持仓只有1天，止损更紧），止盈+2%
+        """
+        stop_loss_pct = 0.03    # Tuesday策略持仓短，止损更紧
+        take_profit_pct = 0.02  # Tuesday目标收益适中
+        
+        if entry_price and entry_price > 0:
+            stop_price = round(entry_price * (1 - stop_loss_pct), 2)
+            take_profit_price = round(entry_price * (1 + take_profit_pct), 2)
+            
+            payload = {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "gtc",
+                "order_class": "bracket",
+                "take_profit": {
+                    "limit_price": str(take_profit_price)
+                },
+                "stop_loss": {
+                    "stop_price": str(stop_price)
+                }
+            }
+            bracket_info = f" [止损${stop_price} / 止盈${take_profit_price}]"
+        else:
+            payload = {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day"
+            }
+            bracket_info = " [无bracket]"
+        
         resp = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=payload)
         if resp.status_code in (200, 201):
-            print(f"  ✅ 买入 {symbol} {qty}股 — {reason}")
+            print(f"  ✅ 买入 {symbol} {qty}股 — {reason}{bracket_info}")
             return True
         print(f"  ❌ 买入失败 {symbol}: {resp.text}")
         return False
     
+    def cancel_open_orders(self, symbol: str):
+        """取消某个标的的所有挂单"""
+        resp = requests.get(f"{BASE_URL}/orders?status=open&symbols={symbol}", headers=HEADERS)
+        if resp.status_code == 200:
+            for order in resp.json():
+                oid = order['id']
+                requests.delete(f"{BASE_URL}/orders/{oid}", headers=HEADERS)
+                print(f"    🗑️ 取消挂单 {symbol} (ID: {oid[:8]}...)")
+    
     def place_sell(self, symbol: str, qty: str, reason: str) -> bool:
+        self.cancel_open_orders(symbol)
+        
         payload = {
             "symbol": symbol,
             "qty": qty,
@@ -281,7 +321,7 @@ class TuesdayTrader:
                     signals[ticker]['reason'] = 'RSI已持仓'
                     continue
                 
-                success = self.place_buy(ticker, qty, f"Tuesday买入: 周一跌{drop_pct*100:.2f}%")
+                success = self.place_buy(ticker, qty, f"Tuesday买入: 周一跌{drop_pct*100:.2f}%", entry_price=today_close)
                 
                 if success:
                     self.tracking[ticker] = {
