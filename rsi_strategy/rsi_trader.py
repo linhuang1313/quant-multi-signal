@@ -58,8 +58,8 @@ STRATEGIES = {
         'ibs_threshold': 0.3,   # IBS < 0.3
         'position_pct': 0.40,   # 占账户40%仓位
         'max_hold_days': 10,    # 最大持仓10天（安全阀）
-        'stop_loss_pct': 0.05,  # 硬止损5%
-        'take_profit_pct': 0.03, # 止盈 3%（均值回归目标适中）
+        'stop_loss_pct': 0.05,  # 硬止损5% (仅触发4.5%交易，但平均换回+0.54%)
+        'take_profit_pct': None, # 不设止盈（回测证明止盈会降低收益）
     },
     'QQQ': {
         'name': 'QQQ RSI均值回归',
@@ -71,8 +71,8 @@ STRATEGIES = {
         'ibs_threshold': 1.0,
         'position_pct': 0.40,   # 占账户40%仓位
         'max_hold_days': 10,
-        'stop_loss_pct': 0.05,
-        'take_profit_pct': 0.04, # 止盈 4%（QQQ波动更大）
+        'stop_loss_pct': 0.05,  # 硬止损5% (触发7.8%交易)
+        'take_profit_pct': None, # 不设止盈
     },
     'GLD': {
         'name': 'GLD 黄金RSI均值回归',
@@ -85,7 +85,7 @@ STRATEGIES = {
         'position_pct': 0.20,   # 占账户20%仓位（黄金波动大，仓位小）
         'max_hold_days': 10,    # 最大持仓10天
         'stop_loss_pct': 0.05,  # 硬止损5%
-        'take_profit_pct': 0.03, # 止盈 3%
+        'take_profit_pct': None, # 不设止盈
     },
 }
 
@@ -182,38 +182,55 @@ class RSITrader:
     
     def place_buy(self, symbol: str, qty: int, reason: str, entry_price: float = None) -> bool:
         """
-        下单买入，同时挂 bracket order（止损+止盈）
-        - 止损: 入场价 * (1 - stop_loss_pct)，即 -5%
-        - 止盈: 入场价 * (1 + take_profit_pct)，基于MA5目标
+        下单买入，同时挂服务端止损单
         
-        Bracket order 由券商实时监控，毫秒级响应，不依赖我们的 cron 扫描
+        回测结论：
+        - 止损 -5%: 仅触发4.5-7.8%的交易，但能避免极端亏损
+        - 止盈: 不设——回测证明任何止盈都会降低均收（因为截断了盈利交易的上行空间）
+        - 出场仍由 MA5 上穿 + 时间止损 10天控制
+        
+        用 OTO (One-Triggers-Other) 单: 买入后自动挂止损，券商实时监控
         """
         params = STRATEGIES.get(symbol, {})
         stop_loss_pct = params.get('stop_loss_pct', 0.05)
-        take_profit_pct = params.get('take_profit_pct', 0.03)
+        take_profit_pct = params.get('take_profit_pct', None)
         
-        # 计算止损止盈价格
         if entry_price and entry_price > 0:
             stop_price = round(entry_price * (1 - stop_loss_pct), 2)
-            take_profit_price = round(entry_price * (1 + take_profit_pct), 2)
             
-            payload = {
-                "symbol": symbol,
-                "qty": str(qty),
-                "side": "buy",
-                "type": "market",
-                "time_in_force": "gtc",
-                "order_class": "bracket",
-                "take_profit": {
-                    "limit_price": str(take_profit_price)
-                },
-                "stop_loss": {
-                    "stop_price": str(stop_price)
+            if take_profit_pct:
+                # Bracket order: 止损 + 止盈
+                take_profit_price = round(entry_price * (1 + take_profit_pct), 2)
+                payload = {
+                    "symbol": symbol,
+                    "qty": str(qty),
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "gtc",
+                    "order_class": "bracket",
+                    "take_profit": {
+                        "limit_price": str(take_profit_price)
+                    },
+                    "stop_loss": {
+                        "stop_price": str(stop_price)
+                    }
                 }
-            }
-            bracket_info = f" [止损${stop_price} / 止盈${take_profit_price}]"
+                bracket_info = f" [止损${stop_price} / 止盈${take_profit_price}]"
+            else:
+                # OTO order: 只挂止损，不设止盈
+                payload = {
+                    "symbol": symbol,
+                    "qty": str(qty),
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "gtc",
+                    "order_class": "oto",
+                    "stop_loss": {
+                        "stop_price": str(stop_price)
+                    }
+                }
+                bracket_info = f" [止损${stop_price} / 无止盈—等MA5出场]"
         else:
-            # fallback: 无法计算价格时用普通市价单
             payload = {
                 "symbol": symbol,
                 "qty": str(qty),
@@ -221,7 +238,7 @@ class RSITrader:
                 "type": "market",
                 "time_in_force": "day"
             }
-            bracket_info = " [无bracket]"
+            bracket_info = " [无服务端订单]"
         
         resp = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=payload)
         if resp.status_code in (200, 201):
